@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,48 @@ import (
 
 type contentModerationTestSettingRepo struct {
 	values map[string]string
+}
+
+type contentModerationRuntimeSettingRepo struct {
+	*contentModerationTestSettingRepo
+	mu               sync.Mutex
+	getMultipleCalls int
+	getMultipleErr   error
+	getMultipleDelay time.Duration
+}
+
+func (r *contentModerationRuntimeSettingRepo) GetMultiple(ctx context.Context, keys []string) (map[string]string, error) {
+	r.mu.Lock()
+	r.getMultipleCalls++
+	err := r.getMultipleErr
+	delay := r.getMultipleDelay
+	r.mu.Unlock()
+	if delay > 0 {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return r.contentModerationTestSettingRepo.GetMultiple(ctx, keys)
+}
+
+func (r *contentModerationRuntimeSettingRepo) setGetMultipleFailure(err error, delay time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.getMultipleErr = err
+	r.getMultipleDelay = delay
+}
+
+func (r *contentModerationRuntimeSettingRepo) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.getMultipleCalls
 }
 
 func (r *contentModerationTestSettingRepo) Get(ctx context.Context, key string) (*Setting, error) {
@@ -716,6 +759,180 @@ func TestContentModerationLoadConfig_LegacyConfigDefaultsModelFilterToAll(t *tes
 	require.Empty(t, cfg.ModelFilter.Models)
 	require.True(t, cfg.includesModel("gpt-5.5"))
 	require.True(t, cfg.includesModel("gpt-5.4"))
+}
+
+func TestContentModerationRuntimeConfig_ConfirmedDisabledDoesNotBlockOnDatabaseOutage(t *testing.T) {
+	cfg := defaultContentModerationConfig()
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	settingRepo := &contentModerationRuntimeSettingRepo{
+		contentModerationTestSettingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+	}
+	svc := NewContentModerationService(
+		settingRepo,
+		&contentModerationTestRepo{},
+		&contentModerationTestHashCache{},
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Model:    "nowledge-balanced",
+		Protocol: ContentModerationProtocolOpenAIChat,
+		Body:     []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+	})
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.Equal(t, 1, settingRepo.callCount())
+
+	settingRepo.setGetMultipleFailure(errors.New("database unavailable"), 0)
+	expireContentModerationRuntimeConfigForTest(svc)
+	start := time.Now()
+	decision, err = svc.Check(context.Background(), ContentModerationCheckInput{
+		Model:    "nowledge-balanced",
+		Protocol: ContentModerationProtocolOpenAIChat,
+		Body:     []byte(`{"messages":[{"role":"user","content":"hello again"}]}`),
+	})
+
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return settingRepo.callCount() >= 2
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestContentModerationRuntimeConfig_EnabledPolicySurvivesDatabaseOutage(t *testing.T) {
+	cfg := defaultContentModerationConfig()
+	cfg.Enabled = true
+	cfg.Mode = ContentModerationModePreBlock
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	settingRepo := &contentModerationRuntimeSettingRepo{
+		contentModerationTestSettingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+	}
+	svc := NewContentModerationService(settingRepo, nil, nil, nil, nil, nil, nil)
+
+	snapshot, err := svc.loadRuntimeConfigForGateway(context.Background())
+	require.NoError(t, err)
+	require.True(t, snapshot.riskControlEnabled)
+	require.True(t, snapshot.config.Enabled)
+	require.Equal(t, ContentModerationModePreBlock, snapshot.config.Mode)
+
+	settingRepo.setGetMultipleFailure(errors.New("database unavailable"), 0)
+	expireContentModerationRuntimeConfigForTest(svc)
+	start := time.Now()
+	snapshot, err = svc.loadRuntimeConfigForGateway(context.Background())
+
+	require.NoError(t, err)
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+	require.True(t, snapshot.riskControlEnabled)
+	require.True(t, snapshot.config.Enabled)
+	require.Equal(t, ContentModerationModePreBlock, snapshot.config.Mode)
+	require.Eventually(t, func() bool {
+		return settingRepo.callCount() >= 2
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestContentModerationRuntimeConfig_InitialLoadIsBoundedAndFailOpen(t *testing.T) {
+	settingRepo := &contentModerationRuntimeSettingRepo{
+		contentModerationTestSettingRepo: &contentModerationTestSettingRepo{values: map[string]string{}},
+		getMultipleDelay:                 5 * time.Second,
+	}
+	svc := NewContentModerationService(
+		settingRepo,
+		&contentModerationTestRepo{},
+		&contentModerationTestHashCache{},
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+
+	start := time.Now()
+	decision, err := svc.Check(context.Background(), ContentModerationCheckInput{
+		Model:    "nowledge-balanced",
+		Protocol: ContentModerationProtocolOpenAIChat,
+		Body:     []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+	})
+
+	require.NoError(t, err)
+	require.True(t, decision.Allowed)
+	require.GreaterOrEqual(t, time.Since(start), contentModerationRuntimeConfigTimeout)
+	require.Less(t, time.Since(start), contentModerationRuntimeConfigTimeout+250*time.Millisecond)
+}
+
+func TestContentModerationRuntimeConfig_CoalescesInitialLoads(t *testing.T) {
+	settingRepo := &contentModerationRuntimeSettingRepo{
+		contentModerationTestSettingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled: "false",
+		}},
+		getMultipleDelay: 50 * time.Millisecond,
+	}
+	svc := NewContentModerationService(settingRepo, nil, nil, nil, nil, nil, nil)
+
+	const callers = 32
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.loadRuntimeConfigForGateway(context.Background())
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, settingRepo.callCount())
+}
+
+func TestContentModerationUpdateConfig_RefreshesRuntimeSnapshot(t *testing.T) {
+	cfg := defaultContentModerationConfig()
+	rawCfg, err := json.Marshal(cfg)
+	require.NoError(t, err)
+	settingRepo := &contentModerationRuntimeSettingRepo{
+		contentModerationTestSettingRepo: &contentModerationTestSettingRepo{values: map[string]string{
+			SettingKeyRiskControlEnabled:      "true",
+			SettingKeyContentModerationConfig: string(rawCfg),
+		}},
+	}
+	svc := NewContentModerationService(settingRepo, nil, nil, nil, nil, nil, nil)
+	_, err = svc.loadRuntimeConfigForGateway(context.Background())
+	require.NoError(t, err)
+
+	enabled := true
+	mode := ContentModerationModePreBlock
+	_, err = svc.UpdateConfig(context.Background(), UpdateContentModerationConfigInput{
+		Enabled: &enabled,
+		Mode:    &mode,
+	})
+	require.NoError(t, err)
+
+	snapshot := svc.currentRuntimeConfigSnapshot()
+	require.NotNil(t, snapshot)
+	require.True(t, snapshot.riskControlEnabled)
+	require.True(t, snapshot.config.Enabled)
+	require.Equal(t, ContentModerationModePreBlock, snapshot.config.Mode)
+	require.Equal(t, 1, settingRepo.callCount())
+}
+
+func expireContentModerationRuntimeConfigForTest(svc *ContentModerationService) {
+	svc.runtimeConfigMu.Lock()
+	defer svc.runtimeConfigMu.Unlock()
+	svc.runtimeConfig.fetchedAt = time.Now().Add(-2 * contentModerationRuntimeConfigFreshTTL)
 }
 
 func TestContentModerationCheck_ModelFilterUsesRequestedModelNotBodyModel(t *testing.T) {

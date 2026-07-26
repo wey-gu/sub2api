@@ -22,6 +22,7 @@ import (
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -90,6 +91,10 @@ const (
 	contentModerationCleanupInterval = 24 * time.Hour
 	contentModerationCleanupTimeout  = 30 * time.Minute
 	contentModerationCleanupDelay    = 5 * time.Minute
+
+	contentModerationRuntimeConfigFreshTTL   = 5 * time.Second
+	contentModerationRuntimeConfigTimeout    = 750 * time.Millisecond
+	contentModerationRuntimeConfigRetryDelay = 2 * time.Second
 )
 
 var contentModerationCategoryOrder = []string{
@@ -474,33 +479,44 @@ type ContentModerationHashCache interface {
 }
 
 type ContentModerationService struct {
-	settingRepo              SettingRepository
-	repo                     ContentModerationRepository
-	hashCache                ContentModerationHashCache
-	groupRepo                GroupRepository
-	userRepo                 UserRepository
-	authCacheInvalidator     APIKeyAuthCacheInvalidator
-	emailService             *EmailService
-	httpClient               *http.Client
-	asyncQueue               chan contentModerationTask
-	workerCount              int
-	apiKeyCursor             atomic.Uint64
-	asyncActive              atomic.Int64
-	asyncEnqueued            atomic.Int64
-	asyncDropped             atomic.Int64
-	asyncProcessed           atomic.Int64
-	asyncErrors              atomic.Int64
-	preBlockActive           atomic.Int64
-	preBlockChecked          atomic.Int64
-	preBlockAllowed          atomic.Int64
-	preBlockBlocked          atomic.Int64
-	preBlockErrors           atomic.Int64
-	preBlockLatencyTotalMS   atomic.Int64
-	lastCleanupUnix          atomic.Int64
-	lastCleanupDeletedHit    atomic.Int64
-	lastCleanupDeletedNonHit atomic.Int64
-	keyHealthMu              sync.Mutex
-	keyHealth                map[string]*contentModerationKeyHealth
+	settingRepo               SettingRepository
+	repo                      ContentModerationRepository
+	hashCache                 ContentModerationHashCache
+	groupRepo                 GroupRepository
+	userRepo                  UserRepository
+	authCacheInvalidator      APIKeyAuthCacheInvalidator
+	emailService              *EmailService
+	httpClient                *http.Client
+	asyncQueue                chan contentModerationTask
+	workerCount               int
+	apiKeyCursor              atomic.Uint64
+	asyncActive               atomic.Int64
+	asyncEnqueued             atomic.Int64
+	asyncDropped              atomic.Int64
+	asyncProcessed            atomic.Int64
+	asyncErrors               atomic.Int64
+	preBlockActive            atomic.Int64
+	preBlockChecked           atomic.Int64
+	preBlockAllowed           atomic.Int64
+	preBlockBlocked           atomic.Int64
+	preBlockErrors            atomic.Int64
+	preBlockLatencyTotalMS    atomic.Int64
+	lastCleanupUnix           atomic.Int64
+	lastCleanupDeletedHit     atomic.Int64
+	lastCleanupDeletedNonHit  atomic.Int64
+	keyHealthMu               sync.Mutex
+	keyHealth                 map[string]*contentModerationKeyHealth
+	runtimeConfigMu           sync.RWMutex
+	runtimeConfig             *contentModerationRuntimeConfigSnapshot
+	runtimeConfigRefresh      singleflight.Group
+	runtimeConfigRefreshing   atomic.Bool
+	runtimeConfigRefreshAfter atomic.Int64
+}
+
+type contentModerationRuntimeConfigSnapshot struct {
+	riskControlEnabled bool
+	config             *ContentModerationConfig
+	fetchedAt          time.Time
 }
 
 type contentModerationTask struct {
@@ -684,6 +700,8 @@ func (s *ContentModerationService) UpdateConfig(ctx context.Context, input Updat
 	if err := s.settingRepo.Set(ctx, SettingKeyContentModerationConfig, string(raw)); err != nil {
 		return nil, fmt.Errorf("save content moderation config: %w", err)
 	}
+	s.updateRuntimeConfigSnapshot(cfg)
+	s.runtimeConfigRefreshAfter.Store(0)
 	return s.configView(cfg), nil
 }
 
@@ -760,18 +778,9 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"protocol", input.Protocol)
 		return allow, nil
 	}
-	if !s.isRiskControlEnabled(ctx) {
-		slog.Info("content_moderation.skip_feature_disabled",
-			"user_id", input.UserID,
-			"api_key_id", input.APIKeyID,
-			"group_id", contentModerationLogGroupID(input.GroupID),
-			"endpoint", input.Endpoint,
-			"protocol", input.Protocol)
-		return allow, nil
-	}
-	cfg, err := s.loadConfig(ctx)
+	runtimeConfig, err := s.loadRuntimeConfigForGateway(ctx)
 	if err != nil {
-		slog.Warn("content_moderation.skip_config_load_failed",
+		slog.Warn("content_moderation.skip_runtime_config_load_failed",
 			"user_id", input.UserID,
 			"api_key_id", input.APIKeyID,
 			"group_id", contentModerationLogGroupID(input.GroupID),
@@ -780,6 +789,16 @@ func (s *ContentModerationService) Check(ctx context.Context, input ContentModer
 			"error", err)
 		return allow, nil
 	}
+	if !runtimeConfig.riskControlEnabled {
+		slog.Info("content_moderation.skip_feature_disabled",
+			"user_id", input.UserID,
+			"api_key_id", input.APIKeyID,
+			"group_id", contentModerationLogGroupID(input.GroupID),
+			"endpoint", input.Endpoint,
+			"protocol", input.Protocol)
+		return allow, nil
+	}
+	cfg := runtimeConfig.config
 	inGroupScope := cfg.includesGroup(input.GroupID)
 	inModelScope := cfg.includesModel(input.Model)
 	slog.Info("content_moderation.config_loaded",
@@ -1439,6 +1458,133 @@ func (s *ContentModerationService) loadConfig(ctx context.Context) (*ContentMode
 	}
 	cfg.normalize()
 	return cfg, nil
+}
+
+func (s *ContentModerationService) loadRuntimeConfigForGateway(ctx context.Context) (*contentModerationRuntimeConfigSnapshot, error) {
+	if snapshot := s.currentRuntimeConfigSnapshot(); snapshot != nil {
+		if time.Since(snapshot.fetchedAt) <= contentModerationRuntimeConfigFreshTTL {
+			return snapshot, nil
+		}
+		s.refreshRuntimeConfigInBackground()
+		return snapshot, nil
+	}
+
+	resultCh := s.runtimeConfigRefresh.DoChan("load", func() (any, error) {
+		loadCtx, cancel := context.WithTimeout(context.Background(), contentModerationRuntimeConfigTimeout)
+		defer cancel()
+		return s.loadAndStoreRuntimeConfig(loadCtx)
+	})
+	timer := time.NewTimer(contentModerationRuntimeConfigTimeout)
+	defer timer.Stop()
+	select {
+	case result := <-resultCh:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		snapshot, ok := result.Val.(*contentModerationRuntimeConfigSnapshot)
+		if !ok || snapshot == nil {
+			return nil, errors.New("content moderation runtime config load returned no snapshot")
+		}
+		return snapshot, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, context.DeadlineExceeded
+	}
+}
+
+func (s *ContentModerationService) loadAndStoreRuntimeConfig(ctx context.Context) (*contentModerationRuntimeConfigSnapshot, error) {
+	settings, err := s.settingRepo.GetMultiple(ctx, []string{
+		SettingKeyRiskControlEnabled,
+		SettingKeyContentModerationConfig,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get content moderation runtime config: %w", err)
+	}
+
+	cfg := defaultContentModerationConfig()
+	if raw := strings.TrimSpace(settings[SettingKeyContentModerationConfig]); raw != "" {
+		if err := json.Unmarshal([]byte(raw), cfg); err != nil {
+			return nil, infraerrors.BadRequest("INVALID_CONTENT_MODERATION_CONFIG", "内容审计配置不是有效 JSON")
+		}
+	}
+	cfg.normalize()
+	snapshot := &contentModerationRuntimeConfigSnapshot{
+		riskControlEnabled: settings[SettingKeyRiskControlEnabled] == "true",
+		config:             cloneContentModerationConfig(cfg),
+		fetchedAt:          time.Now(),
+	}
+	s.storeRuntimeConfigSnapshot(snapshot)
+	return cloneContentModerationRuntimeConfigSnapshot(snapshot), nil
+}
+
+func (s *ContentModerationService) refreshRuntimeConfigInBackground() {
+	if refreshAfter := s.runtimeConfigRefreshAfter.Load(); refreshAfter > time.Now().UnixNano() {
+		return
+	}
+	if !s.runtimeConfigRefreshing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.runtimeConfigRefreshing.Store(false)
+		_, err, _ := s.runtimeConfigRefresh.Do("load", func() (any, error) {
+			loadCtx, cancel := context.WithTimeout(context.Background(), contentModerationRuntimeConfigTimeout)
+			defer cancel()
+			return s.loadAndStoreRuntimeConfig(loadCtx)
+		})
+		if err != nil {
+			s.runtimeConfigRefreshAfter.Store(time.Now().Add(contentModerationRuntimeConfigRetryDelay).UnixNano())
+			snapshot := s.currentRuntimeConfigSnapshot()
+			if snapshot == nil {
+				slog.Warn("content_moderation.runtime_config_refresh_failed", "error", err)
+				return
+			}
+			slog.Warn("content_moderation.runtime_config_stale_used",
+				"age_ms", time.Since(snapshot.fetchedAt).Milliseconds(),
+				"risk_control_enabled", snapshot.riskControlEnabled,
+				"moderation_enabled", snapshot.config.Enabled,
+				"moderation_mode", snapshot.config.Mode,
+				"error", err)
+			return
+		}
+		s.runtimeConfigRefreshAfter.Store(0)
+	}()
+}
+
+func (s *ContentModerationService) currentRuntimeConfigSnapshot() *contentModerationRuntimeConfigSnapshot {
+	s.runtimeConfigMu.RLock()
+	defer s.runtimeConfigMu.RUnlock()
+	return s.runtimeConfig
+}
+
+func (s *ContentModerationService) storeRuntimeConfigSnapshot(snapshot *contentModerationRuntimeConfigSnapshot) {
+	s.runtimeConfigMu.Lock()
+	defer s.runtimeConfigMu.Unlock()
+	s.runtimeConfig = cloneContentModerationRuntimeConfigSnapshot(snapshot)
+}
+
+func (s *ContentModerationService) updateRuntimeConfigSnapshot(cfg *ContentModerationConfig) {
+	s.runtimeConfigMu.Lock()
+	defer s.runtimeConfigMu.Unlock()
+	if s.runtimeConfig == nil {
+		return
+	}
+	s.runtimeConfig = &contentModerationRuntimeConfigSnapshot{
+		riskControlEnabled: s.runtimeConfig.riskControlEnabled,
+		config:             cloneContentModerationConfig(cfg),
+		fetchedAt:          time.Now(),
+	}
+}
+
+func cloneContentModerationRuntimeConfigSnapshot(snapshot *contentModerationRuntimeConfigSnapshot) *contentModerationRuntimeConfigSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	return &contentModerationRuntimeConfigSnapshot{
+		riskControlEnabled: snapshot.riskControlEnabled,
+		config:             cloneContentModerationConfig(snapshot.config),
+		fetchedAt:          snapshot.fetchedAt,
+	}
 }
 
 func (s *ContentModerationService) isRiskControlEnabled(ctx context.Context) bool {
