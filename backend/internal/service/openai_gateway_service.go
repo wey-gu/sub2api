@@ -368,6 +368,7 @@ type OpenAIGatewayService struct {
 
 	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountDBRecheck              openAIAccountDBRecheckCache
 	openaiOAuth429WindowStartUnixNano   atomic.Int64
 	openaiOAuth429WindowCount           atomic.Int64
 	openaiWSRetryMetrics                openAIWSRetryMetrics
@@ -1711,7 +1712,7 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 		return nil
 	}
-	account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, requestedModel, requireCompact, requiredCapability)
+	account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, groupID, requestedModel, requireCompact, requiredCapability)
 	if account == nil || !openAIStickyAccountMatchesGroup(account, groupID) {
 		_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 		return nil
@@ -1754,7 +1755,7 @@ func (s *OpenAIGatewayService) selectBestAccount(ctx context.Context, groupID *i
 		if fresh == nil {
 			continue
 		}
-		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, false, requiredCapability)
+		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, groupID, requestedModel, false, requiredCapability)
 		if fresh == nil {
 			continue
 		}
@@ -1905,7 +1906,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 				}
 				if !clearSticky && isOpenAIAccountEligibleForRequest(ctx, account, requestedModel, false, requiredCapability) {
-					account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, requestedModel, requireCompact, requiredCapability)
+					account = s.recheckSelectedOpenAIAccountFromDB(ctx, account, groupID, requestedModel, requireCompact, requiredCapability)
 					if account == nil {
 						_ = s.deleteStickySessionAccountID(ctx, groupID, sessionHash)
 					} else if !openAIStickyAccountMatchesGroup(account, groupID) {
@@ -2040,7 +2041,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if fresh == nil {
 				continue
 			}
-			fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, requireCompact, requiredCapability)
+			fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, groupID, requestedModel, requireCompact, requiredCapability)
 			if fresh == nil {
 				continue
 			}
@@ -2074,7 +2075,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if fresh == nil {
 				continue
 			}
-			fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, requireCompact, requiredCapability)
+			fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, groupID, requestedModel, requireCompact, requiredCapability)
 			if fresh == nil {
 				continue
 			}
@@ -2119,7 +2120,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		if fresh == nil {
 			continue
 		}
-		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, requestedModel, requireCompact, requiredCapability)
+		fresh = s.recheckSelectedOpenAIAccountFromDB(ctx, fresh, groupID, requestedModel, requireCompact, requiredCapability)
 		if fresh == nil {
 			continue
 		}
@@ -2190,28 +2191,108 @@ func (s *OpenAIGatewayService) resolveFreshSchedulableOpenAIAccount(ctx context.
 	return fresh
 }
 
-func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDB(ctx context.Context, account *Account, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
+func (s *OpenAIGatewayService) recheckSelectedOpenAIAccountFromDB(ctx context.Context, account *Account, groupID *int64, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
 	if account == nil {
 		return nil
 	}
 	if s.schedulerSnapshot == nil || s.accountRepo == nil {
-		if !isOpenAIAccountEligibleForRequest(ctx, account, requestedModel, requireCompact, requiredCapability) {
-			return nil
-		}
-		return account
+		return s.validateRecheckedOpenAIAccount(ctx, account, groupID, requestedModel, requireCompact, requiredCapability)
 	}
 
-	latest, err := s.accountRepo.GetByID(ctx, account.ID)
-	if err != nil || latest == nil {
+	now := time.Now()
+	if cached := s.openaiAccountDBRecheck.fresh(account.ID, now); cached != nil {
+		return s.validateRecheckedOpenAIAccount(ctx, cached, groupID, requestedModel, requireCompact, requiredCapability)
+	}
+
+	key := strconv.FormatInt(account.ID, 10)
+	value, _, _ := s.openaiAccountDBRecheck.sf.Do(key, func() (any, error) {
+		now := time.Now()
+		if cached := s.openaiAccountDBRecheck.fresh(account.ID, now); cached != nil {
+			return cached, nil
+		}
+
+		timeout, freshTTL, staleTTL := s.openAIAccountDBRecheckDurations()
+		dbCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		latest, err := s.accountRepo.GetByID(dbCtx, account.ID)
+		if err == nil && latest != nil {
+			s.openaiAccountDBRecheck.store(latest, now, freshTTL, staleTTL)
+			return latest, nil
+		}
+
+		if errors.Is(err, ErrAccountNotFound) || (err == nil && latest == nil) {
+			s.openaiAccountDBRecheck.remove(account.ID)
+			return (*Account)(nil), nil
+		}
+
+		stale := s.openaiAccountDBRecheck.stale(account.ID, now)
+		if stale == nil {
+			slog.Warn("openai_account_db_recheck_failed_closed",
+				"account_id", account.ID,
+				"error", err,
+			)
+			return (*Account)(nil), nil
+		}
+		slog.Warn("openai_account_db_recheck_stale_used",
+			"account_id", account.ID,
+			"error", err,
+			"stale_window_seconds", int64(staleTTL/time.Second),
+		)
+		return stale, nil
+	})
+
+	latest, _ := value.(*Account)
+	if latest == nil {
 		return nil
 	}
-	if !isOpenAIAccountEligibleForRequest(ctx, latest, requestedModel, requireCompact, requiredCapability) {
+	cloned := *latest
+	return s.validateRecheckedOpenAIAccount(ctx, &cloned, groupID, requestedModel, requireCompact, requiredCapability)
+}
+
+func (s *OpenAIGatewayService) openAIAccountDBRecheckDurations() (time.Duration, time.Duration, time.Duration) {
+	timeout := 750 * time.Millisecond
+	freshTTL := time.Second
+	staleTTL := 2 * time.Minute
+	if s != nil && s.cfg != nil {
+		cfg := s.cfg.Gateway.Scheduling
+		if cfg.DBRecheckTimeoutMS > 0 {
+			timeout = time.Duration(cfg.DBRecheckTimeoutMS) * time.Millisecond
+		}
+		if cfg.DBRecheckFreshTTLMS > 0 {
+			freshTTL = time.Duration(cfg.DBRecheckFreshTTLMS) * time.Millisecond
+		}
+		if cfg.DBRecheckStaleIfErrorSeconds > 0 {
+			staleTTL = time.Duration(cfg.DBRecheckStaleIfErrorSeconds) * time.Second
+		}
+	}
+	return timeout, freshTTL, staleTTL
+}
+
+func (s *OpenAIGatewayService) validateRecheckedOpenAIAccount(ctx context.Context, account *Account, groupID *int64, requestedModel string, requireCompact bool, requiredCapability OpenAIEndpointCapability) *Account {
+	if account == nil {
 		return nil
 	}
-	if s.isOpenAIAccountRuntimeBlocked(latest) {
+	if !s.openAIAccountMatchesSchedulingGroup(account, groupID) {
 		return nil
 	}
-	return latest
+	if !isOpenAIAccountEligibleForRequest(ctx, account, requestedModel, requireCompact, requiredCapability) {
+		return nil
+	}
+	if s.isOpenAIAccountRuntimeBlocked(account) {
+		return nil
+	}
+	return account
+}
+
+func (s *OpenAIGatewayService) openAIAccountMatchesSchedulingGroup(account *Account, groupID *int64) bool {
+	if s == nil || s.cfg == nil || s.cfg.RunMode == "" {
+		return account != nil
+	}
+	if s.cfg.RunMode == config.RunModeSimple {
+		return account != nil
+	}
+	return openAIStickyAccountMatchesGroup(account, groupID)
 }
 
 func (s *OpenAIGatewayService) getSchedulableAccount(ctx context.Context, accountID int64) (*Account, error) {

@@ -3,6 +3,7 @@ package service
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -26,7 +27,7 @@ const (
 
 const (
 	openAIAdvancedSchedulerSettingCacheTTL  = 5 * time.Second
-	openAIAdvancedSchedulerSettingDBTimeout = 2 * time.Second
+	openAIAdvancedSchedulerSettingDBTimeout = 750 * time.Millisecond
 )
 
 type cachedOpenAIAdvancedSchedulerSetting struct {
@@ -36,6 +37,68 @@ type cachedOpenAIAdvancedSchedulerSetting struct {
 
 var openAIAdvancedSchedulerSettingCache atomic.Value // *cachedOpenAIAdvancedSchedulerSetting
 var openAIAdvancedSchedulerSettingSF singleflight.Group
+
+type openAIAccountDBRecheckEntry struct {
+	account    *Account
+	freshUntil time.Time
+	staleUntil time.Time
+	nextProbe  time.Time
+}
+
+type openAIAccountDBRecheckCache struct {
+	mu      sync.Mutex
+	entries map[int64]openAIAccountDBRecheckEntry
+	sf      singleflight.Group
+}
+
+func (c *openAIAccountDBRecheckCache) fresh(accountID int64, now time.Time) *Account {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[accountID]
+	fresh := now.Before(entry.freshUntil)
+	retrySuppressed := now.Before(entry.nextProbe) && now.Before(entry.staleUntil)
+	if !ok || entry.account == nil || (!fresh && !retrySuppressed) {
+		return nil
+	}
+	cloned := *entry.account
+	return &cloned
+}
+
+func (c *openAIAccountDBRecheckCache) stale(accountID int64, now time.Time) *Account {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[accountID]
+	if !ok || entry.account == nil || !now.Before(entry.staleUntil) {
+		return nil
+	}
+	entry.nextProbe = now.Add(time.Second)
+	c.entries[accountID] = entry
+	cloned := *entry.account
+	return &cloned
+}
+
+func (c *openAIAccountDBRecheckCache) store(account *Account, now time.Time, freshTTL, staleTTL time.Duration) {
+	if account == nil || account.ID <= 0 {
+		return
+	}
+	cloned := *account
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[int64]openAIAccountDBRecheckEntry)
+	}
+	c.entries[account.ID] = openAIAccountDBRecheckEntry{
+		account:    &cloned,
+		freshUntil: now.Add(freshTTL),
+		staleUntil: now.Add(staleTTL),
+	}
+}
+
+func (c *openAIAccountDBRecheckCache) remove(accountID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, accountID)
+}
 
 type OpenAIAccountScheduleRequest struct {
 	GroupID                 *int64
@@ -375,7 +438,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
+	account = s.service.recheckSelectedOpenAIAccountFromDB(ctx, account, req.GroupID, req.RequestedModel, req.RequireCompact, req.RequiredCapability)
 	if account == nil || !openAIStickyAccountMatchesGroup(account, req.GroupID) || !s.isAccountTransportCompatible(account, req.RequiredTransport) {
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
@@ -860,7 +923,7 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrder(
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			continue
 		}
-		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.RequestedModel, false, req.RequiredCapability)
+		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.RequestedModel, false, req.RequiredCapability)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			continue
 		}
@@ -901,7 +964,14 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 	// require_privacy_set: 获取分组信息
 	var schedGroup *Group
 	if req.GroupID != nil && s.service.schedulerSnapshot != nil {
-		schedGroup, _ = s.service.schedulerSnapshot.GetGroupByID(ctx, *req.GroupID)
+		var groupErr error
+		schedGroup, groupErr = s.service.schedulerSnapshot.GetGroupByID(ctx, *req.GroupID)
+		if groupErr != nil {
+			return nil, 0, 0, 0, fmt.Errorf("resolve scheduling group: %w", groupErr)
+		}
+		if schedGroup == nil && s.service.schedulerSnapshot.groupRepo != nil {
+			return nil, 0, 0, 0, fmt.Errorf("resolve scheduling group %d: not found", *req.GroupID)
+		}
 	}
 
 	filtered := make([]*Account, 0, len(accounts))
@@ -999,7 +1069,7 @@ func (s *defaultOpenAIAccountScheduler) selectByLoadBalance(
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			continue
 		}
-		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.RequestedModel, false, req.RequiredCapability)
+		fresh = s.service.recheckSelectedOpenAIAccountFromDB(ctx, fresh, req.GroupID, req.RequestedModel, false, req.RequiredCapability)
 		if fresh == nil || !s.isAccountTransportCompatible(fresh, req.RequiredTransport) || !s.isAccountRequestCompatible(ctx, fresh, req) {
 			continue
 		}
@@ -1115,26 +1185,38 @@ func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerEnabled(ctx context.Cont
 	}
 
 	result, _, _ := openAIAdvancedSchedulerSettingSF.Do(openAIAdvancedSchedulerSettingKey, func() (any, error) {
-		if cached, ok := openAIAdvancedSchedulerSettingCache.Load().(*cachedOpenAIAdvancedSchedulerSetting); ok && cached != nil {
+		stale, _ := openAIAdvancedSchedulerSettingCache.Load().(*cachedOpenAIAdvancedSchedulerSetting)
+		if cached := stale; cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
 				return cached.enabled, nil
 			}
 		}
 
 		enabled := false
+		cacheTTL := openAIAdvancedSchedulerSettingCacheTTL
 		if repo := s.openAIAdvancedSchedulerSettingRepo(); repo != nil {
 			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIAdvancedSchedulerSettingDBTimeout)
 			defer cancel()
 
 			value, err := repo.GetValue(dbCtx, openAIAdvancedSchedulerSettingKey)
-			if err == nil {
+			switch {
+			case err == nil:
 				enabled = strings.EqualFold(strings.TrimSpace(value), "true")
+			case errors.Is(err, ErrSettingNotFound):
+				enabled = false
+			case stale != nil:
+				enabled = stale.enabled
+				cacheTTL = time.Second
+				slog.Warn("openai_advanced_scheduler_setting_stale_used", "error", err)
+			default:
+				cacheTTL = time.Second
+				slog.Warn("openai_advanced_scheduler_setting_load_failed_closed", "error", err)
 			}
 		}
 
 		openAIAdvancedSchedulerSettingCache.Store(&cachedOpenAIAdvancedSchedulerSetting{
 			enabled:   enabled,
-			expiresAt: time.Now().Add(openAIAdvancedSchedulerSettingCacheTTL).UnixNano(),
+			expiresAt: time.Now().Add(cacheTTL).UnixNano(),
 		})
 		return enabled, nil
 	})
