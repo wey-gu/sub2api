@@ -52,6 +52,36 @@ func (s *openAIRecordUsageBillingRepoStub) Apply(ctx context.Context, cmd *Usage
 	return &UsageBillingApplyResult{Applied: true}, nil
 }
 
+type openAIRecordUsageAtomicBillingRepoStub struct {
+	UsageBillingRepository
+
+	results  []*UsageBillingApplyResult
+	errs     []error
+	calls    int
+	lastCmd  *UsageBillingCommand
+	lastLog  *UsageLog
+	applyHit bool
+}
+
+func (s *openAIRecordUsageAtomicBillingRepoStub) Apply(ctx context.Context, cmd *UsageBillingCommand) (*UsageBillingApplyResult, error) {
+	s.applyHit = true
+	return s.ApplyWithUsageLog(ctx, cmd, nil)
+}
+
+func (s *openAIRecordUsageAtomicBillingRepoStub) ApplyWithUsageLog(_ context.Context, cmd *UsageBillingCommand, usageLog *UsageLog) (*UsageBillingApplyResult, error) {
+	index := s.calls
+	s.calls++
+	s.lastCmd = cmd
+	s.lastLog = usageLog
+	if index < len(s.errs) && s.errs[index] != nil {
+		return nil, s.errs[index]
+	}
+	if index < len(s.results) && s.results[index] != nil {
+		return s.results[index], nil
+	}
+	return &UsageBillingApplyResult{Applied: true}, nil
+}
+
 func TestOpenAIGatewayServiceRecordUsage_RejectsNilInput(t *testing.T) {
 	svc := &OpenAIGatewayService{}
 	require.Error(t, svc.RecordUsage(context.Background(), nil))
@@ -241,6 +271,82 @@ func TestOpenAIGatewayServiceRecordUsage_ZeroUsageStillWritesUsageLog(t *testing
 	require.Zero(t, billingRepo.lastCmd.APIKeyQuotaCost)
 	require.Zero(t, billingRepo.lastCmd.APIKeyRateLimitCost)
 	require.Zero(t, billingRepo.lastCmd.AccountQuotaCost)
+}
+
+func TestOpenAIGatewayServiceRecordUsage_AtomicBillingOwnsUsageLog(t *testing.T) {
+	usageRepo := &openAIRecordUsageLogRepoStub{}
+	billingRepo := &openAIRecordUsageAtomicBillingRepoStub{}
+	svc := newOpenAIRecordUsageServiceWithBillingRepoForTest(
+		usageRepo,
+		billingRepo,
+		&openAIRecordUsageUserRepoStub{},
+		&openAIRecordUsageSubRepoStub{},
+		nil,
+	)
+
+	err := svc.RecordUsage(context.Background(), &OpenAIRecordUsageInput{
+		Result: &OpenAIForwardResult{
+			RequestID: "resp_atomic_usage",
+			Usage: OpenAIUsage{
+				InputTokens:  12,
+				OutputTokens: 3,
+			},
+			Model:    "gpt-5.1",
+			Duration: time.Second,
+		},
+		APIKey:  &APIKey{ID: 1010, Group: &Group{RateMultiplier: 1}},
+		User:    &User{ID: 2010},
+		Account: &Account{ID: 3010, Type: AccountTypeAPIKey},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, billingRepo.calls)
+	require.False(t, billingRepo.applyHit)
+	require.NotNil(t, billingRepo.lastLog)
+	require.Equal(t, "resp_atomic_usage", billingRepo.lastLog.RequestID)
+	require.Equal(t, 0, usageRepo.calls)
+}
+
+func TestApplyUsageBillingWithRetry_RetriesTransientDatabaseFailure(t *testing.T) {
+	repo := &openAIRecordUsageAtomicBillingRepoStub{
+		errs: []error{
+			errors.New("pq: the database system is not yet accepting connections"),
+			nil,
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	result, persisted, err := applyUsageBillingWithRetry(
+		ctx,
+		repo,
+		&UsageBillingCommand{RequestID: "retry-1", APIKeyID: 1},
+		&UsageLog{RequestID: "retry-1", APIKeyID: 1},
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Applied)
+	require.True(t, persisted)
+	require.Equal(t, 2, repo.calls)
+}
+
+func TestApplyUsageBillingWithRetry_DoesNotRetryPermanentFailure(t *testing.T) {
+	repo := &openAIRecordUsageAtomicBillingRepoStub{
+		errs: []error{ErrUsageBillingRequestConflict},
+	}
+
+	result, persisted, err := applyUsageBillingWithRetry(
+		context.Background(),
+		repo,
+		&UsageBillingCommand{RequestID: "conflict-1", APIKeyID: 1},
+		&UsageLog{RequestID: "conflict-1", APIKeyID: 1},
+	)
+
+	require.ErrorIs(t, err, ErrUsageBillingRequestConflict)
+	require.Nil(t, result)
+	require.False(t, persisted)
+	require.Equal(t, 1, repo.calls)
 }
 
 func TestOpenAIGatewayServiceRecordUsage_MissingPricingRecordsZeroCostUsageLog(t *testing.T) {

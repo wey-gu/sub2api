@@ -121,3 +121,11 @@ type UsageBillingApplyResult struct {
 type UsageBillingRepository interface {
 	Apply(ctx context.Context, cmd *UsageBillingCommand) (*UsageBillingApplyResult, error)
 }
+
+// UsageBillingAtomicRepository persists the usage log in the same transaction
+// as the billable effects. Implementations must preserve the same request
+// fingerprint conflict and at-most-once semantics as Apply.
+type UsageBillingAtomicRepository interface {
+	UsageBillingRepository
+	ApplyWithUsageLog(ctx context.Context, cmd *UsageBillingCommand, usageLog *UsageLog) (*UsageBillingApplyResult, error)
+}

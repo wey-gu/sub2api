@@ -6011,7 +6011,7 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	}
 
 	billingErr := func() error {
-		_, err := applyUsageBilling(ctx, requestID, usageLog, &postUsageBillingParams{
+		_, usageLogPersisted, err := applyUsageBilling(ctx, requestID, usageLog, &postUsageBillingParams{
 			Cost:                  cost,
 			User:                  user,
 			APIKey:                apiKey,
@@ -6023,13 +6023,18 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 			APIKeyService:         input.APIKeyService,
 			Platform:              PlatformFromAPIKey(apiKey),
 		}, s.billingDeps(), s.usageBillingRepo)
-		return err
+		if err != nil {
+			return err
+		}
+		if !usageLogPersisted {
+			writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
+		}
+		return nil
 	}()
 
 	if billingErr != nil {
 		return billingErr
 	}
-	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
 
 	return nil
 }

@@ -416,7 +416,7 @@ func TestGatewayServiceRecordUsage_DroppedUsageLogDoesNotSyncFallback(t *testing
 
 func TestGatewayServiceRecordUsage_BillingErrorSkipsUsageLogWrite(t *testing.T) {
 	usageRepo := &openAIRecordUsageLogRepoStub{}
-	billingRepo := &openAIRecordUsageBillingRepoStub{err: context.DeadlineExceeded}
+	billingRepo := &openAIRecordUsageBillingRepoStub{err: errors.New("billing rejected")}
 	userRepo := &openAIRecordUsageUserRepoStub{}
 	subRepo := &openAIRecordUsageSubRepoStub{}
 	svc := newGatewayRecordUsageServiceWithBillingRepoForTest(usageRepo, billingRepo, userRepo, subRepo)

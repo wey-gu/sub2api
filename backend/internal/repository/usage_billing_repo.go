@@ -20,6 +20,14 @@ func NewUsageBillingRepository(_ *dbent.Client, sqlDB *sql.DB) service.UsageBill
 }
 
 func (r *usageBillingRepository) Apply(ctx context.Context, cmd *service.UsageBillingCommand) (_ *service.UsageBillingApplyResult, err error) {
+	return r.apply(ctx, cmd, nil)
+}
+
+func (r *usageBillingRepository) ApplyWithUsageLog(ctx context.Context, cmd *service.UsageBillingCommand, usageLog *service.UsageLog) (_ *service.UsageBillingApplyResult, err error) {
+	return r.apply(ctx, cmd, usageLog)
+}
+
+func (r *usageBillingRepository) apply(ctx context.Context, cmd *service.UsageBillingCommand, usageLog *service.UsageLog) (_ *service.UsageBillingApplyResult, err error) {
 	if cmd == nil {
 		return &service.UsageBillingApplyResult{}, nil
 	}
@@ -46,13 +54,21 @@ func (r *usageBillingRepository) Apply(ctx context.Context, cmd *service.UsageBi
 	if err != nil {
 		return nil, err
 	}
-	if !applied {
-		return &service.UsageBillingApplyResult{Applied: false}, nil
+
+	result := &service.UsageBillingApplyResult{Applied: applied}
+	if applied {
+		if err := r.applyUsageBillingEffects(ctx, tx, cmd, result); err != nil {
+			return nil, err
+		}
 	}
 
-	result := &service.UsageBillingApplyResult{Applied: true}
-	if err := r.applyUsageBillingEffects(ctx, tx, cmd, result); err != nil {
-		return nil, err
+	if usageLog != nil {
+		usageRepo := &usageLogRepository{sql: tx}
+		if _, err := usageRepo.createSingle(ctx, tx, usageLog); err != nil {
+			return nil, err
+		}
+	} else if !applied {
+		return result, nil
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -96,6 +112,12 @@ func (r *usageBillingRepository) claimUsageBillingKey(ctx context.Context, tx *s
 	if err == nil {
 		if strings.TrimSpace(archivedFingerprint) != strings.TrimSpace(cmd.RequestFingerprint) {
 			return false, service.ErrUsageBillingRequestConflict
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM usage_billing_dedup
+			WHERE request_id = $1 AND api_key_id = $2
+		`, cmd.RequestID, cmd.APIKeyID); err != nil {
+			return false, err
 		}
 		return false, nil
 	}

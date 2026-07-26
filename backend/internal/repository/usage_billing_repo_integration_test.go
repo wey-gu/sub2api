@@ -80,6 +80,90 @@ func TestUsageBillingRepositoryApply_DeduplicatesBalanceBilling(t *testing.T) {
 	require.Equal(t, 1, dedupCount)
 }
 
+func TestUsageBillingRepositoryApplyWithUsageLog_IsAtomicAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	client := testEntClient(t)
+	repo := NewUsageBillingRepository(client, integrationDB).(service.UsageBillingAtomicRepository)
+
+	user := mustCreateUser(t, client, &service.User{
+		Email:        fmt.Sprintf("usage-billing-atomic-user-%d@example.com", time.Now().UnixNano()),
+		PasswordHash: "hash",
+		Balance:      100,
+	})
+	apiKey := mustCreateApiKey(t, client, &service.APIKey{
+		UserID: user.ID,
+		Key:    "sk-usage-billing-atomic-" + uuid.NewString(),
+		Name:   "billing-atomic",
+	})
+	account := mustCreateAccount(t, client, &service.Account{
+		Name: "usage-billing-atomic-account-" + uuid.NewString(),
+		Type: service.AccountTypeAPIKey,
+	})
+
+	requestID := uuid.NewString()
+	cmd := &service.UsageBillingCommand{
+		RequestID:   requestID,
+		APIKeyID:    apiKey.ID,
+		UserID:      user.ID,
+		AccountID:   account.ID,
+		AccountType: service.AccountTypeAPIKey,
+		BalanceCost: 1.25,
+	}
+	newLog := func() *service.UsageLog {
+		return &service.UsageLog{
+			UserID:       user.ID,
+			APIKeyID:     apiKey.ID,
+			AccountID:    account.ID,
+			RequestID:    requestID,
+			Model:        "atomic-model",
+			InputTokens:  10,
+			OutputTokens: 2,
+			ActualCost:   1.25,
+			TotalCost:    1.25,
+			CreatedAt:    time.Now().UTC(),
+		}
+	}
+
+	result, err := repo.ApplyWithUsageLog(ctx, cmd, newLog())
+	require.NoError(t, err)
+	require.True(t, result.Applied)
+
+	result, err = repo.ApplyWithUsageLog(ctx, cmd, newLog())
+	require.NoError(t, err)
+	require.False(t, result.Applied)
+
+	var balance float64
+	require.NoError(t, integrationDB.QueryRowContext(ctx, "SELECT balance FROM users WHERE id = $1", user.ID).Scan(&balance))
+	require.InDelta(t, 98.75, balance, 0.000001)
+
+	var logCount int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM usage_logs WHERE request_id = $1 AND api_key_id = $2",
+		requestID, apiKey.ID,
+	).Scan(&logCount))
+	require.Equal(t, 1, logCount)
+
+	failingRequestID := uuid.NewString()
+	failingCmd := *cmd
+	failingCmd.RequestID = failingRequestID
+	failingLog := newLog()
+	failingLog.RequestID = failingRequestID
+	failingLog.APIKeyID = apiKey.ID + 999999
+
+	_, err = repo.ApplyWithUsageLog(ctx, &failingCmd, failingLog)
+	require.Error(t, err)
+
+	require.NoError(t, integrationDB.QueryRowContext(ctx, "SELECT balance FROM users WHERE id = $1", user.ID).Scan(&balance))
+	require.InDelta(t, 98.75, balance, 0.000001, "usage-log insert failure must roll back billing")
+
+	var dedupCount int
+	require.NoError(t, integrationDB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM usage_billing_dedup WHERE request_id = $1 AND api_key_id = $2",
+		failingRequestID, apiKey.ID,
+	).Scan(&dedupCount))
+	require.Zero(t, dedupCount)
+}
+
 func TestUsageBillingRepositoryApply_DeduplicatesSubscriptionBilling(t *testing.T) {
 	ctx := context.Background()
 	client := testEntClient(t)

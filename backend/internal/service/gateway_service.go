@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,7 +72,10 @@ IMPORTANT: You must NEVER generate or guess URLs for the user unless you are con
 
 	defaultUserGroupRateCacheTTL = 30 * time.Second
 	defaultModelsListCacheTTL    = 15 * time.Second
-	postUsageBillingTimeout      = 15 * time.Second
+	postUsageBillingTimeout      = 60 * time.Second
+	usageBillingAttemptTimeout   = 5 * time.Second
+	usageBillingInitialBackoff   = 250 * time.Millisecond
+	usageBillingMaxBackoff       = 2 * time.Second
 	debugGatewayBodyEnv          = "SUB2API_DEBUG_GATEWAY_BODY"
 	// 上游错误体只需要提取错误 JSON/日志摘要，默认 512KiB 避免错误风暴叠加大请求体。
 	gatewayUpstreamErrorBodyReadLimit int64 = 512 << 10
@@ -8542,28 +8546,28 @@ func buildUsageBillingCommand(requestID string, usageLog *UsageLog, p *postUsage
 	return cmd
 }
 
-func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog, p *postUsageBillingParams, deps *billingDeps, repo UsageBillingRepository) (bool, error) {
+func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog, p *postUsageBillingParams, deps *billingDeps, repo UsageBillingRepository) (bool, bool, error) {
 	if p == nil || deps == nil {
-		return false, nil
+		return false, false, nil
 	}
 
 	cmd := buildUsageBillingCommand(requestID, usageLog, p)
 	if cmd == nil || cmd.RequestID == "" || repo == nil {
 		postUsageBilling(ctx, p, deps)
-		return true, nil
+		return true, false, nil
 	}
 
 	billingCtx, cancel := detachedBillingContext(ctx)
 	defer cancel()
 
-	result, err := repo.Apply(billingCtx, cmd)
+	result, usageLogPersisted, err := applyUsageBillingWithRetry(billingCtx, repo, cmd, usageLog)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	if result == nil || !result.Applied {
 		deps.deferredService.ScheduleLastUsedUpdate(p.Account.ID)
-		return false, nil
+		return false, usageLogPersisted, nil
 	}
 
 	if result.APIKeyQuotaExhausted {
@@ -8573,7 +8577,106 @@ func applyUsageBilling(ctx context.Context, requestID string, usageLog *UsageLog
 	}
 
 	finalizePostUsageBilling(billingCtx, p, deps, result)
-	return true, nil
+	return true, usageLogPersisted, nil
+}
+
+func applyUsageBillingWithRetry(ctx context.Context, repo UsageBillingRepository, cmd *UsageBillingCommand, usageLog *UsageLog) (*UsageBillingApplyResult, bool, error) {
+	var (
+		result            *UsageBillingApplyResult
+		err               error
+		usageLogPersisted bool
+		backoff           = usageBillingInitialBackoff
+		started           = time.Now()
+	)
+
+	for attempt := 1; ; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, usageBillingAttemptTimeout)
+		if atomicRepo, ok := repo.(UsageBillingAtomicRepository); ok && usageLog != nil {
+			result, err = atomicRepo.ApplyWithUsageLog(attemptCtx, cmd, usageLog)
+			usageLogPersisted = err == nil
+		} else {
+			result, err = repo.Apply(attemptCtx, cmd)
+			usageLogPersisted = false
+		}
+		cancel()
+
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("usage_billing_recovered",
+					"attempts", attempt,
+					"elapsed_ms", time.Since(started).Milliseconds(),
+				)
+			}
+			return result, usageLogPersisted, nil
+		}
+		if !isTransientUsageBillingError(err) {
+			return nil, false, err
+		}
+
+		wait := backoff + time.Duration(mathrand.Int63n(int64(backoff/2)+1))
+		if attempt == 1 {
+			slog.Warn("usage_billing_transient_retry",
+				"attempt", attempt,
+				"backoff_ms", wait.Milliseconds(),
+				"error", err,
+			)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, false, fmt.Errorf("usage billing retry exhausted: %w", err)
+		case <-timer.C:
+		}
+		if backoff < usageBillingMaxBackoff {
+			backoff *= 2
+			if backoff > usageBillingMaxBackoff {
+				backoff = usageBillingMaxBackoff
+			}
+		}
+	}
+}
+
+func isTransientUsageBillingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
+		return true
+	}
+
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"database system is starting up",
+		"database system is not yet accepting connections",
+		"connection refused",
+		"connection reset by peer",
+		"server closed the connection unexpectedly",
+		"terminating connection due to administrator command",
+		"broken pipe",
+		"connection is closed",
+		"connection timed out",
+		"i/o timeout",
+		"sqlstate 40001",
+		"sqlstate 40p01",
+		"sqlstate 57p01",
+		"sqlstate 57p02",
+		"sqlstate 57p03",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func finalizePostUsageBilling(ctx context.Context, p *postUsageBillingParams, deps *billingDeps, result *UsageBillingApplyResult) {
@@ -8971,7 +9074,7 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 		quotaPlatform = PlatformFromAPIKey(apiKey)
 	}
 	requestID := usageLog.RequestID
-	_, billingErr := applyUsageBilling(ctx, requestID, usageLog, &postUsageBillingParams{
+	_, usageLogPersisted, billingErr := applyUsageBilling(ctx, requestID, usageLog, &postUsageBillingParams{
 		Cost:                  cost,
 		User:                  user,
 		APIKey:                apiKey,
@@ -8987,7 +9090,9 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	if billingErr != nil {
 		return billingErr
 	}
-	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.gateway")
+	if !usageLogPersisted {
+		writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.gateway")
+	}
 
 	return nil
 }
